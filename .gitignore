@@ -21,3 +21,6 @@ builds/vc/ipch/
 *.opensdf
 *.sdf
 *.ipch
+build
+.vscode
+.xmake
