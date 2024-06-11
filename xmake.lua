@@ -124,3 +124,15 @@ target("hsync_http")
 
 
 target_end()
+
+target("hsync_http_httplib")
+    set_enabled(false)
+    set_kind("binary")
+
+    add_files("./hsync_http.cpp")
+    add_files("./client_download_http_httplib.cpp")
+
+    add_deps("HDiffPatch", "DifDiffPatch", "hsync", "zstd")
+
+
+target_end()
