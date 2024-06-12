@@ -27,6 +27,7 @@
  OTHER DEALINGS IN THE SOFTWARE.
  */
 #include "client_download_http.h"
+#include "httplib/httplib.h"
 #include <assert.h>
 #include "hsync_import_patch.h" // HSYNC_VERSION_STRING
 #include "../HDiffPatch/file_for_patch.h"
@@ -37,18 +38,6 @@
 #endif
 using namespace hdiff_private;
 
-#include "httplib/httplib.h"
-#if defined(_MSC_VER)
-#	ifdef MINIHTTP_USE_MBEDTLS
-#		pragma comment( lib, "Advapi32.lib" )
-#	endif
-#	if defined(_WIN32_WCE)
-#		pragma comment( lib, "ws2.lib" )
-#	else
-#		pragma comment( lib, "ws2_32.lib" )
-#	endif
-#endif /* _MSC_VER */
-
 static const size_t kBestBufSize = hpatch_kFileIOBestMaxSize>>4;
 static const size_t kBestRangesCacheSize=hpatch_kFileIOBestMaxSize;
 static const int    kTimeout_s=10;
@@ -56,21 +45,22 @@ static const uint64_t kNullRangePos=~(uint64_t)0;
 static const hpatch_StreamPos_t kEmptyEndPos=kNullRangePos;
 static const char*  kHttpUserAgent="hsynz/" HSYNC_VERSION_STRING;
 
-std::string ParseHostAddressFromURL(const char* InURL)
+std::string ParseHostAddressFromURL(std::string InURL)
 {
     std::string HostAddress;
 
-    if(strncmp(InURL, "http:://", 8) == 0
-        || strncmp(InURL, "https:://", 9) == 0)
-    {
-        const char *quotPtr = strchr(InURL + 10, '/');
-        if(quotPtr == NULL)
-        {
-            return HostAddress;
-        }
+    std::string http = InURL.substr(0, 7);
+    std::string https = InURL.substr(0, 8);
 
-        int position = quotPtr - (InURL + 10);
-        HostAddress = InURL + position;
+    if(http == "http://" || https == "https://")
+    {
+        std::string TempStr = InURL.substr(9);
+        int pos = TempStr.find('/');
+        if(pos > 1)
+        {
+            HostAddress = InURL.substr(0, 9 + pos);
+        }
+        
     }
     return HostAddress;
 }
@@ -79,31 +69,28 @@ class HsynzHttpClient
 {
 public:
 
-    HsynzHttpClient(const char* InHostAddress)
+    typedef std::pair<uint64_t,uint64_t> TRange;
+
+    HsynzHttpClient(std::string InHostAddress)
     {
-        for(int i = 0; i < ParallelNum; ++i)
-        {
-            if(HttpClientList[i] != nullptr)
-            {
-                HttpClientList[i] = new httplib::Client(InHostAddress); ;
-            }
-        }
+        HostAddress = ParseHostAddressFromURL(InHostAddress);
+        FileURL = InHostAddress.substr(HostAddress.length());
+        HttpClient = new httplib::Client(HostAddress);
     }
 
     ~HsynzHttpClient()
     {
-        for(int i = 0; i < ParallelNum; ++i)
+        if(HttpClient != nullptr)
         {
-            if(HttpClientList[i] != nullptr)
-            {
-                delete HttpClientList[i];
-                HttpClientList[i] = nullptr;
-            }
+            HttpClient->stop();
+            delete HttpClient;
+            HttpClient = nullptr;
         }
     }
 
    static hpatch_BOOL readSyncDataBegin(IReadSyncDataListener* listener,const TNeedSyncInfos* needSyncInfo,
-                                         uint32_t blockIndex,hpatch_StreamPos_t posInNewSyncData,hpatch_StreamPos_t posInNeedSyncData){
+                                         uint32_t blockIndex,hpatch_StreamPos_t posInNewSyncData,hpatch_StreamPos_t posInNeedSyncData)
+    {
         HsynzHttpClient* self=(HsynzHttpClient*)listener->readSyncDataImport;
         self->nsi=needSyncInfo;
         try{
@@ -111,8 +98,7 @@ public:
             self->_cache.realloc(cacheSize);
             self->_writePos=0;
             self->_readPos=0;
-            //if (!self->_sendDownloads_all(blockIndex,posInNewSyncData))
-            //    return hpatch_FALSE;
+
             if (!self->_sendDownloads_init(blockIndex,posInNewSyncData)) //step by step send
                 return hpatch_FALSE;
         }catch(...){
@@ -121,7 +107,9 @@ public:
 
         return hpatch_TRUE;
     }
-    static void readSyncDataEnd(IReadSyncDataListener* listener){ 
+
+    static void readSyncDataEnd(IReadSyncDataListener* listener)
+    { 
         HsynzHttpClient* self=(HsynzHttpClient*)listener->readSyncDataImport;
         self->_closeAll(); 
     }
@@ -140,7 +128,8 @@ public:
 protected:
 
 
-    bool _sendDownloads_init(uint32_t blockIndex,hpatch_StreamPos_t posInNewSyncData){
+    bool _sendDownloads_init(uint32_t blockIndex,hpatch_StreamPos_t posInNewSyncData)
+    {
         assert(nsi!=0);
         printf("\nhttp download from block index %d/%d\n",blockIndex,nsi->blockCount);
         curBlockIndex=blockIndex;
@@ -148,10 +137,11 @@ protected:
         return _sendDownloads_step();
     }
 
-    bool _sendDownloads_step(){
+    bool _sendDownloads_step()
+    {
         try{
             while (curBlockIndex<nsi->blockCount){
-                //makeRanges(_hd.Ranges(),curBlockIndex,curPosInNewSyncData);
+                makeRanges(RangeList,curBlockIndex,curPosInNewSyncData);
                 //if (!_hd.Ranges().empty())
                     //return _hd.doDownload(_file_url);
             }
@@ -163,55 +153,94 @@ protected:
 
     hpatch_BOOL readSyncData(uint32_t blockIndex,hpatch_StreamPos_t posInNewSyncData,
                                     hpatch_StreamPos_t posInNeedSyncData,
-                                    unsigned char* out_syncDataBuf,uint32_t syncDataSize){
-        while (syncDataSize>0){
+                                    unsigned char* out_syncDataBuf,uint32_t syncDataSize)
+    {
+        while ( false && syncDataSize>0)
+        {
             size_t savedSize=_savedSize();
-            if (savedSize>0){
+            if (savedSize>0)
+            {
                 size_t readSize=(savedSize<=syncDataSize)?savedSize:syncDataSize;
                 _readFromCache(out_syncDataBuf,readSize);
                 out_syncDataBuf+=readSize;
                 syncDataSize-=(uint32_t)readSize;
                 continue;
             }
-
-            while(isNeedUpdate()&&(_emptySize()>GetBufSize())){
-                if (!update()){
-    #if (_IS_USED_MULTITHREAD)
-                    this_thread_yield();
-    #else
-                    //sleep?
-    #endif
-                }
-            }
-            savedSize=_savedSize();
-            if (savedSize==0){
-                if (!IsSuccess()||is_write_error)
-                    return hpatch_FALSE;
-                if ((!isNeedUpdate())&&(requestCount==0))
-                    return hpatch_FALSE;
-            }
         }
+
+        int process = 0;
+
+        if(HttpClient != nullptr)
+        {
+            HttpClient->Get(FileURL, 
+                [&process, out_syncDataBuf, syncDataSize](const char *data, size_t data_length)
+                {
+                    int chunkSize = std::min<int>(syncDataSize - process, data_length);
+                    memcpy(out_syncDataBuf + process, data, chunkSize);
+                    process += chunkSize;
+                    if(process == syncDataSize)
+                    {
+                        return false;
+                    }
+                    return true;
+                },
+
+                [](uint64_t current, uint64_t tota)
+                {
+                    return true;
+                }
+            );
+        }
+
+
         return hpatch_TRUE;
     }
 
-    void _closeAll(){
-        for(int i = 0; i < ParallelNum; ++i)
-        {
-            if(HttpClientList[i] != nullptr)
-            {
-                HttpClientList[i]->stop();
-            }
-        }
+    size_t _savedSize() const
+    {
+        return ((_writePos>=_readPos)?_writePos:_writePos+_cache.size())-_readPos;
+    }
 
+    void _readFromCache(unsigned char* out_syncDataBuf,size_t readSize)
+    {
+        const size_t cacheSize=_cache.size();
+        while (readSize>0){
+            size_t rlen=cacheSize-_readPos;
+            rlen=(rlen<=readSize)?rlen:readSize;
+            memcpy(out_syncDataBuf,_cache.data()+_readPos,rlen);
+            out_syncDataBuf+=rlen;
+            readSize-=rlen;
+            _readPos+=rlen;
+            _readPos=(_readPos<cacheSize)?_readPos:(_readPos-cacheSize);
+        }
+    }
+
+    void _closeAll()
+    {
+        if(HttpClient != nullptr)
+        {
+            HttpClient->stop();
+        }
+    }
+
+    void makeRanges(std::vector<TRange>& out_ranges,uint32_t& blockIndex,
+                    hpatch_StreamPos_t& posInNewSyncData){
+        out_ranges.resize(kStepRangeNumber);
+        size_t gotRangeCount=TNeedSyncInfos_getNextRanges(nsi,(hpatch_StreamPos_t*)out_ranges.data(),
+                                                          kStepRangeNumber,&blockIndex,&posInNewSyncData);
+        out_ranges.resize(gotRangeCount);
     }
 
 protected:
 
-    static const int ParallelNum = 8;
+    httplib::Client* HttpClient = nullptr;
 
-    httplib::Client* HttpClientList[ParallelNum] = { nullptr };
+    std::string HostAddress;
+    std::string FileURL;
 
     //range download
+
+    std::vector<TRange> RangeList;
 
     uint32_t            curBlockIndex;
     hpatch_StreamPos_t  curPosInNewSyncData;
@@ -220,7 +249,7 @@ protected:
     TAutoMem          _cache;
     size_t            _readPos;
     size_t            _writePos;
-    size_t            kStepRangeNumber;
+    size_t            kStepRangeNumber = 1;
     const TNeedSyncInfos* nsi;
 
 };
